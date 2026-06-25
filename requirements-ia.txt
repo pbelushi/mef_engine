@@ -1,0 +1,5 @@
+# Dependência opcional das camadas de IA (mef_engine/ia/) — parsing
+# assistido e explicação. O motor de cálculo funciona sem isso; só
+# necessário se for usar essas duas funcionalidades de borda.
+google-genai>=0.3
+python-dotenv>=1.0

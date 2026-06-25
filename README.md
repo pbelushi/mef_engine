@@ -71,6 +71,17 @@ mef_engine/
   export/
     excel.py       exportação para .xlsx, uma aba por bloco (Resumo, Fluxo de
                    Caixa, Ativo Financeiro, Financiamento)
+  ia/
+    cliente.py     wrapper do Gemini (Google AI) — única porta de saída para IA
+    explicacao.py  resumo em linguagem natural do ResultadoMEF
+    parsing.py     fallback de IA para detecção de faixas (heurística falhou)
+  api/
+    formulario.py  FormularioMEF (Pydantic) — schema simplificado de borda para a
+                   interface web, com para_input_mef() e model_json_schema()
+web/
+  app.py       interface Streamlit do beta: senha compartilhada, formulário,
+               Calcular, download do Excel, explicação opcional por IA
+Dockerfile     imagem para Cloud Run (Streamlit, porta via $PORT)
 tests/
   test_validacao.py           núcleo + setores reais
   test_concessoes.py          três tipos de concessão
@@ -82,6 +93,8 @@ tests/
   test_deteccao_faixas.py     detecção automática de faixas por cabeçalho
   test_curva_desembolso.py    ingestão de CAPEX/OPEX com curva de desembolso
   test_export_excel.py        exportação Excel: abas, omissão condicional, valores
+  test_ia.py                  camadas de IA: orquestração sem rede (IA injetável)
+  test_formulario.py          schema Pydantic do formulário: validação, preset, JSON Schema
 ```
 
 ## Indexação por inflação (v3.2) — reajuste de tarifa/contraprestação
@@ -255,10 +268,120 @@ testar valores de célula sem round-trip por disco. Estrutura montada por
 código, não um template `.xlsx` externo (não havia um disponível); ponto de
 extensão natural para preencher um template fornecido pelo usuário depois.
 
-## Próximos incrementos (em ordem de risco)
+## Camadas de IA na borda (v3.9) — parsing assistido e explicação
 
-1. Camadas de IA de parsing/explicação (na borda, nunca no cálculo).
-2. Schema em Pydantic (gera JSON Schema do formulário/CSV) → interface web → cloud.
+`mef_engine/ia/` usa o Gemini (Google AI, pacote `google-genai`) para duas
+funcionalidades, ambas estritamente de borda — `core.py`/`modules.py`/
+`engine.py` não importam nada deste pacote, e nada aqui altera um número já
+calculado deterministicamente:
+
+  - **Explicação** (`explicar_resultado`): verbaliza em português o
+    `ResultadoMEF.resumo()` já calculado — não recebe os fluxos brutos, não
+    recalcula nada, só explica os números prontos.
+  - **Parsing assistido** (`detectar_e_ingerir_com_ia_fallback`): só chama a
+    IA quando `detectar_faixas` (heurística) não acha NENHUMA seção. A
+    sugestão da IA passa pela MESMA `ingerir_secao` — e portanto a mesma
+    reconciliação soma-vs-total — que qualquer faixa manual ou heurística;
+    uma sugestão que não bate com o total ainda é recusada.
+
+Em ambos os casos, a função que de fato chama a IA (`gerar_texto`) é
+injetável — os testes (`tests/test_ia.py`) verificam prompt, parsing da
+resposta e fallback gracioso sem nenhuma chamada de rede real. Sem
+`GOOGLE_API_KEY` configurada (ou sem o SDK instalado, ou se a chamada
+falhar), a IA fica indisponível (`IAIndisponivel`) e quem chamou decide o
+fallback — nunca uma dependência dura do motor.
+
+### Configuração
+
+Dependência opcional, em `requirements-ia.txt` (`google-genai` +
+`python-dotenv`): `pip install -r requirements-ia.txt`. A chave do Gemini
+Developer API (gerada em aistudio.google.com/apikey) vai num `.env` na raiz
+do projeto — copie `.env.example`, preencha `GOOGLE_API_KEY` e nunca
+commite o `.env` real (já está no `.gitignore`); `cliente.py` carrega esse
+arquivo automaticamente via `python-dotenv`.
+
+**Nota de segurança (beta com chave compartilhada)**: se uma única chave for
+distribuída a vários beta-testers (em vez de cada um gerar a própria),
+configure um limite de gasto/cota nessa chave no Google AI Studio/Cloud
+Console antes de distribuir — qualquer um com acesso ao `.env` local pode
+extrair a chave; o limite de gasto é o que reduz o estrago se isso acontecer.
+
+## Schema Pydantic + interface web + Cloud Run (v3.10)
+
+Último item do roadmap original. Decisão de design: o schema Pydantic vive
+NA BORDA (`mef_engine/api/formulario.py`), não substitui as dataclasses do
+motor (`schema.py`) — mesma filosofia já usada para IA e ingestão. `core.py`/
+`modules.py`/`engine.py` continuam sem saber que o Pydantic existe.
+
+  - **`FormularioMEF`**: versão simplificada do `InputMEF` para o beta —
+    projeto, tipo de concessão, timing, taxa de desconto e linhas de
+    CAPEX/OPEX/receita. Deliberadamente NÃO expõe financiamento, indexação,
+    módulo fiscal completo ou bifurcação por linha nesta v1 (ficam nos
+    defaults do motor); reduzir o formulário a um MVP testável valeu mais que
+    cobrir 100% do `InputMEF` de uma vez.
+  - **`para_input_mef()`**: converte o formulário simplificado num `InputMEF`
+    de verdade, aplicando `preset_por_tipo` (regime contábil, fração ativo
+    financeiro) automaticamente — o beta-tester não escolhe isso diretamente.
+  - **`FormularioMEF.model_json_schema()`**: gera o JSON Schema do roadmap —
+    contrato único entre o formulário e qualquer cliente futuro (web atual,
+    eventual API depois).
+  - **`web/app.py`** (Streamlit): gate por senha única compartilhada
+    (`APP_PASSWORD`, mesmo mecanismo `.env`/dotenv da chave de IA — vazio =
+    acesso liberado, com aviso), formulário na barra lateral espelhando o
+    `FormularioMEF`, botão Calcular, tabela de `resumo()`, download do Excel
+    (`export.exportar_excel`) e botão opcional "Explicar com IA" (oculto se
+    `GOOGLE_API_KEY` não estiver configurada).
+  - **`Dockerfile`**: imagem `python:3.12-slim` com as três camadas de
+    requirements (`requirements.txt`, `-ia`, `-web`), porta via `$PORT`
+    (convenção Cloud Run) com default 8501 para execução local.
+
+Testado com `streamlit.testing.v1.AppTest` (execução headless do script,
+sem servidor real) e com o servidor de desenvolvimento (`streamlit run`,
+verificado via HTTP): formulário sem erros, fluxo completo até o resultado,
+gate de senha (recusa senha errada, libera com a correta) e geração do Excel
+— sem exceções em nenhum caso. Um bug real foi encontrado e corrigido nesse
+processo: `st.secrets.get(...)` levanta exceção quando não existe nenhum
+`secrets.toml` no projeto (caso normal fora do Streamlit Community Cloud) —
+corrigido para tratar a ausência de secrets como "sem senha via secrets",
+sem derrubar o app.
+
+Prova de corretude (teste [5] em test_formulario.py): `para_input_mef()` +
+`engine.calcular()` produz exatamente o mesmo resultado (erro 0.0) que montar
+o `InputMEF` equivalente à mão — a camada Pydantic não introduz nem perde
+nenhuma informação na conversão.
+
+### Rodando localmente
+
+```bash
+pip install -r requirements.txt -r requirements-ia.txt -r requirements-web.txt
+streamlit run web/app.py
+```
+
+### Deploy no Google Cloud Run (manual — não automatizado por este projeto)
+
+```bash
+gcloud run deploy motor-mef --source . --region <sua-regiao> \
+  --set-env-vars APP_PASSWORD=<senha-do-beta> \
+  --set-env-vars GOOGLE_API_KEY=<chave-compartilhada>
+```
+
+**Nota de segurança**: a chave do Gemini é compartilhada entre os
+beta-testers (decisão já tomada, ver seção de IA acima) — antes de
+publicar a URL do Cloud Run, configure um limite de gasto/cota nessa chave
+no Google AI Studio/Cloud Console, já que o app passa a ser acessível por
+qualquer pessoa com o link + senha.
+
+## Próximos incrementos
+
+Roadmap original do protótipo concluído. Possíveis próximos passos,
+dependendo do retorno do beta:
+
+  - Cobrir no formulário web os campos hoje só editáveis via `InputMEF`
+    direto (financiamento, indexação, módulo fiscal completo, bifurcação por
+    linha) — expandir `FormularioMEF` ou expor um modo "avançado".
+  - Persistência de cenários (salvar/recuperar um `FormularioMEF` preenchido).
+  - Autenticação por usuário (hoje é uma senha única compartilhada, adequada
+    só para o beta).
 
 ## Alvos de validação por setor
 
@@ -285,10 +408,12 @@ python3 tests/test_bifurcacao_receita.py
 python3 tests/test_deteccao_faixas.py
 python3 tests/test_curva_desembolso.py
 python3 tests/test_export_excel.py
+python3 tests/test_ia.py
+python3 tests/test_formulario.py
 ```
 
-## Sequência recomendada até a nuvem
+## Sequência recomendada até a nuvem (concluída)
 
-Ingestão (feito) → schema Pydantic → interface que reflete o schema →
-Google Cloud quando houver produto testável ponta a ponta. Deploy antes de
-existir caminho de entrada de dados daria um endpoint que ninguém sabe usar.
+Ingestão → schema Pydantic → interface que reflete o schema → Cloud Run. O
+deploy em si (`gcloud run deploy`) é manual — depende das credenciais GCP do
+usuário, não é executado por este repositório.

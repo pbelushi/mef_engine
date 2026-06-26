@@ -12,6 +12,8 @@ de valores (numérica) por varredura, e a linha de total por palavra-chave.
 """
 from __future__ import annotations
 
+import csv
+import io
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -28,6 +30,101 @@ def _norm(s) -> str:
         return ""
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
     return s.strip().lower()
+
+
+class _Celula:
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
+class _GradeLista:
+    """Adaptador que expõe a mesma interface mínima de uma worksheet openpyxl
+    (`.cell(row=, column=).value`, `.max_row`, `.max_column`) sobre uma lista
+    de listas em memória — permite reusar as heurísticas de detecção de
+    seção (pensadas para openpyxl) também em arquivos .csv/.xls, que não têm
+    um objeto worksheet nativo equivalente."""
+
+    def __init__(self, linhas: list[list]):
+        self._linhas = linhas
+        self.max_row = len(linhas)
+        self.max_column = max((len(l) for l in linhas), default=0)
+
+    def cell(self, row, column):
+        linha = self._linhas[row - 1] if 0 < row <= self.max_row else []
+        valor = linha[column - 1] if 0 < column <= len(linha) else None
+        return _Celula(valor)
+
+
+_PADRAO_NUM_BR = re.compile(r"^-?\d{1,3}(\.\d{3})*,\d+$|^-?\d+,\d+$")
+
+
+def _paresear_numero_csv(s: str):
+    """Converte uma célula textual de .csv em float quando plausível — aceita
+    tanto o formato BR (1.234,56) quanto o internacional (1234.56); devolve a
+    string original (rótulo) se não for reconhecível como número."""
+    s = s.strip()
+    if not s:
+        return None
+    if _PADRAO_NUM_BR.match(s):
+        return float(s.replace(".", "").replace(",", "."))
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+
+def _ler_csv_generico(conteudo: bytes) -> list[list]:
+    """Decodifica bytes de .csv (utf-8 com BOM ou, na falha, latin-1 — comum
+    em export do Excel BR) e detecta o delimitador (',' ou ';') por
+    amostragem, em vez de impor um separador fixo."""
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            texto = conteudo.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        texto = conteudo.decode("utf-8", errors="replace")
+    amostra = texto[:2048]
+    try:
+        delimitador = csv.Sniffer().sniff(amostra, delimiters=",;\t").delimiter
+    except csv.Error:
+        delimitador = ";" if amostra.count(";") > amostra.count(",") else ","
+    leitor = csv.reader(io.StringIO(texto), delimiter=delimitador)
+    return [[_paresear_numero_csv(c) if isinstance(c, str) else c for c in linha]
+            for linha in leitor]
+
+
+def _ler_xls_generico(conteudo: bytes) -> list[list]:
+    import xlrd
+    livro = xlrd.open_workbook(file_contents=conteudo)
+    planilha = livro.sheet_by_index(0)
+    return [[planilha.cell_value(r, c) or None for c in range(planilha.ncols)]
+            for r in range(planilha.nrows)]
+
+
+def carregar_grade(arquivo, nome_arquivo: str, aba: str | None = None):
+    """Carrega qualquer um dos formatos aceitos (.xlsx/.xlsm via openpyxl,
+    .xls via xlrd, .csv via csv) numa interface única de leitura por célula —
+    o resto do módulo (detecção de seção, reconciliação) não precisa saber
+    qual formato originou os dados.
+
+    `arquivo` é um caminho (str) ou um objeto com `.read()` (ex.: upload do
+    Streamlit); `nome_arquivo` só serve para decidir o formato pela extensão
+    quando `arquivo` não é, ele mesmo, o caminho.
+    """
+    ext = nome_arquivo.rsplit(".", 1)[-1].lower()
+    if ext in ("xlsx", "xlsm"):
+        wb = openpyxl.load_workbook(arquivo, data_only=True)
+        return wb[aba] if aba else wb[wb.sheetnames[0]]
+    conteudo = arquivo.read() if hasattr(arquivo, "read") else open(arquivo, "rb").read()
+    if ext == "xls":
+        return _GradeLista(_ler_xls_generico(conteudo))
+    if ext == "csv":
+        return _GradeLista(_ler_csv_generico(conteudo))
+    raise ValueError(f"Formato não suportado: .{ext} (use .xlsx, .xls ou .csv)")
 
 
 @dataclass
@@ -216,14 +313,23 @@ def detectar_faixas(ws, linha_ini: int = 1, linha_fim: int | None = None,
     return faixas
 
 
-def detectar_e_ingerir(caminho: str, aba: str,
+def detectar_e_ingerir(caminho: str, aba: str | None = None,
                        faixas: list[tuple[int, int, str]] | None = None) -> list:
     """Ingere múltiplas seções de uma aba. `faixas` = [(ini, fim, titulo), ...]
     explícitas, ou None (default) para detectar automaticamente por
     cabeçalho via `detectar_faixas` — útil quando a heurística não bate ou
     para focar um teste no parser+reconciliação isoladamente."""
-    wb = openpyxl.load_workbook(caminho, data_only=True)
-    ws = wb[aba]
+    ws = carregar_grade(caminho, caminho, aba)
     if faixas is None:
         faixas = detectar_faixas(ws)
     return [ingerir_secao(ws, ini, fim, tit) for ini, fim, tit in faixas]
+
+
+def ingerir_arquivo_secao_unica(arquivo, nome_arquivo: str, titulo: str = "") -> SecaoIngerida:
+    """Ingestão para upload dedicado a um único bloco (ex.: CAPEX e OPEX
+    enviados como arquivos separados na interface web) — não precisa
+    detectar limites de seção por cabeçalho como `detectar_faixas`, porque o
+    arquivo inteiro JÁ é a seção; só lê a grade inteira como um bloco de
+    itens + (opcionalmente) uma linha de total para reconciliação."""
+    ws = carregar_grade(arquivo, nome_arquivo)
+    return ingerir_secao(ws, 1, ws.max_row, titulo=titulo)

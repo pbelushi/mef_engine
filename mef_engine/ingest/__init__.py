@@ -7,8 +7,10 @@ from .indexador import (
     serie_para_taxas_acumuladas,
 )
 from .planilha import (
-    SecaoIngerida, detectar_e_ingerir, detectar_faixas, ingerir_secao,
+    SecaoIngerida, carregar_grade, detectar_e_ingerir, detectar_faixas,
+    ingerir_arquivo_secao_unica, ingerir_secao,
 )
+from .receita import LinhaReceitaIngerida, ingerir_receitas_volume
 
 
 def secao_para_capex(sec: SecaoIngerida, exigir_reconciliacao: bool = True):
@@ -52,3 +54,17 @@ def secao_para_opex(sec: SecaoIngerida, exigir_reconciliacao: bool = True):
         else:
             linhas.append(LinhaOPEX(nome=i.nome, valor_periodo=i.valor))
     return linhas
+
+
+def arquivo_para_capex(arquivo, nome_arquivo: str, exigir_reconciliacao: bool = True):
+    """Lê um upload dedicado de CAPEX (arquivo inteiro = uma seção só) e
+    converte direto para linhas de CAPEX do schema — atalho para a interface
+    web, que substitui a digitação manual por upload de planilha."""
+    sec = ingerir_arquivo_secao_unica(arquivo, nome_arquivo, titulo="CAPEX")
+    return secao_para_capex(sec, exigir_reconciliacao)
+
+
+def arquivo_para_opex(arquivo, nome_arquivo: str, exigir_reconciliacao: bool = True):
+    """Equivalente a `arquivo_para_capex` para OPEX."""
+    sec = ingerir_arquivo_secao_unica(arquivo, nome_arquivo, titulo="OPEX")
+    return secao_para_opex(sec, exigir_reconciliacao)

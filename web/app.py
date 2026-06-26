@@ -9,6 +9,7 @@ aqui — só orquestração de UI.
 """
 from __future__ import annotations
 
+import csv
 import io
 import os
 import sys
@@ -24,6 +25,76 @@ from mef_engine.engine import calcular
 from mef_engine.export import exportar_excel
 from mef_engine.ia.cliente import chave_configurada
 from mef_engine.ia.explicacao import explicar_resultado
+from mef_engine.ingest import (
+    arquivo_para_capex, arquivo_para_opex, ingerir_receitas_volume,
+)
+
+TIPOS_PLANILHA = ["csv", "xls", "xlsx"]
+
+
+def _csv_bytes(linhas: list[list]) -> bytes:
+    buf = io.StringIO()
+    csv.writer(buf).writerows(linhas)
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _modelo_capex() -> bytes:
+    return _csv_bytes([["Item", "Valor"], ["Obra 1", 1000], ["Obra 2", 500],
+                       ["Total", 1500]])
+
+
+def _modelo_opex() -> bytes:
+    return _csv_bytes([["Item", "Valor por período"], ["Custo 1", 10],
+                       ["Custo 2", 5], ["Total", 15]])
+
+
+def _modelo_receita() -> bytes:
+    return _csv_bytes([["Nome", "Tarifa", "Volume por período", "Crescimento anual (%)"],
+                       ["Tarifa 1", 1.0, 100, 0]])
+
+
+def _upload_capex_opex(label: str, key: str, modelo: bytes, nome_modelo: str,
+                       conversor, campo_valor: str) -> list[dict]:
+    """Upload + parsing de uma planilha de CAPEX/OPEX (item, valor, linha de
+    Total opcional p/ reconciliação automática) — substitui a digitação
+    manual linha a linha. `campo_valor` é 'valor_total' (CAPEX) ou
+    'valor_periodo' (OPEX): o nome do dataclass do schema não muda, só o
+    rótulo do campo que o formulário simplificado espera."""
+    st.caption("Planilha com itens em linhas e, opcionalmente, uma linha "
+              "'Total' para conferência automática da soma.")
+    st.download_button(f"Baixar modelo ({nome_modelo})", data=modelo,
+                       file_name=nome_modelo, mime="text/csv", key=f"{key}_modelo")
+    arquivo = st.file_uploader(label, type=TIPOS_PLANILHA, key=key)
+    if arquivo is None:
+        return []
+    try:
+        linhas = conversor(arquivo, arquivo.name)
+    except Exception as e:
+        st.error(f"Erro ao ler planilha: {e}")
+        return []
+    st.success(f"{len(linhas)} itens lidos de '{arquivo.name}'.")
+    return [{"nome": l.nome, campo_valor: getattr(l, campo_valor)} for l in linhas]
+
+
+def _upload_receita() -> list[dict]:
+    st.caption("Planilha com colunas Nome, Tarifa, Volume por período e, "
+              "opcionalmente, Crescimento anual (%).")
+    st.download_button("Baixar modelo (receita)", data=_modelo_receita(),
+                       file_name="modelo_receita.csv", mime="text/csv",
+                       key="receita_modelo")
+    arquivo = st.file_uploader("Planilha de receita (tarifa × volume)",
+                               type=TIPOS_PLANILHA, key="upload_receita")
+    if arquivo is None:
+        return []
+    try:
+        linhas = ingerir_receitas_volume(arquivo, arquivo.name)
+    except Exception as e:
+        st.error(f"Erro ao ler planilha: {e}")
+        return []
+    st.success(f"{len(linhas)} linhas de receita lidas de '{arquivo.name}'.")
+    return [{"nome": r.nome, "tarifa": r.tarifa, "volume_periodo": r.volume_periodo,
+             "crescimento_anual_pct": r.crescimento_anual_pct} for r in linhas]
+
 
 st.set_page_config(page_title="Motor MEF — Beta", layout="wide")
 
@@ -68,36 +139,17 @@ def _formulario_sidebar() -> FormularioMEF | None:
         "Taxa de desconto anual (%)", min_value=0.0, value=8.0, step=0.5) / 100
 
     st.subheader("CAPEX")
-    n_capex = st.number_input("Número de linhas de CAPEX", min_value=1, value=1, key="n_capex")
-    capex = []
-    for i in range(n_capex):
-        c1, c2 = st.columns(2)
-        nome = c1.text_input(f"Nome CAPEX {i+1}", f"Obra {i+1}", key=f"capex_nome_{i}")
-        valor = c2.number_input(f"Valor total CAPEX {i+1}", min_value=0.0, value=100.0,
-                                key=f"capex_valor_{i}")
-        capex.append({"nome": nome, "valor_total": valor})
+    capex = _upload_capex_opex(
+        "Planilha de CAPEX", "upload_capex", _modelo_capex(), "modelo_capex.csv",
+        arquivo_para_capex, "valor_total")
 
     st.subheader("OPEX")
-    n_opex = st.number_input("Número de linhas de OPEX", min_value=0, value=1, key="n_opex")
-    opex = []
-    for i in range(n_opex):
-        c1, c2 = st.columns(2)
-        nome = c1.text_input(f"Nome OPEX {i+1}", f"Custo {i+1}", key=f"opex_nome_{i}")
-        valor = c2.number_input(f"Valor por período OPEX {i+1}", min_value=0.0, value=10.0,
-                                key=f"opex_valor_{i}")
-        opex.append({"nome": nome, "valor_periodo": valor})
+    opex = _upload_capex_opex(
+        "Planilha de OPEX", "upload_opex", _modelo_opex(), "modelo_opex.csv",
+        arquivo_para_opex, "valor_periodo")
 
     st.subheader("Receita tarifária (volume × tarifa)")
-    n_receita = st.number_input("Número de linhas de receita por volume", min_value=0,
-                                value=1, key="n_receita_vol")
-    receitas_volume = []
-    for i in range(n_receita):
-        c1, c2, c3 = st.columns(3)
-        nome = c1.text_input(f"Nome receita {i+1}", f"Tarifa {i+1}", key=f"rv_nome_{i}")
-        tarifa = c2.number_input(f"Tarifa {i+1}", min_value=0.01, value=1.0, key=f"rv_tarifa_{i}")
-        volume = c3.number_input(f"Volume por período {i+1}", min_value=0.01, value=100.0,
-                                 key=f"rv_volume_{i}")
-        receitas_volume.append({"nome": nome, "tarifa": tarifa, "volume_periodo": volume})
+    receitas_volume = _upload_receita()
 
     st.subheader("Contraprestação pública (valor fixo por período)")
     n_receita_fixa = st.number_input("Número de linhas de contraprestação", min_value=0,

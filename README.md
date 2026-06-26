@@ -65,12 +65,20 @@ mef_engine/
                financiamento (FCFE)
   engine.py    Orquestrador dos 3 tipos + aporte + financiamento no fluxo (FCFF e FCFE)
   ingest/
-    planilha.py    ingestão de CAPEX/OPEX (faixas auto-detectadas por cabeçalho +
-                   curvas de desembolso por coluna de período)
+    planilha.py    ingestão de CAPEX/OPEX em .xlsx/.xls/.csv (faixas
+                   auto-detectadas por cabeçalho + curvas de desembolso por
+                   coluna de período); `carregar_grade` unifica os 3 formatos
+                   numa única interface de leitura por célula; `ingerir_
+                   arquivo_secao_unica` trata um upload dedicado (1 arquivo =
+                   1 bloco) sem precisar detectar limites de seção
+    receita.py     ingestão de receita tarifária (tarifa × volume) de planilha
+                   dedicada, por cabeçalho de colunas (sem total para ancorar)
     indexador.py   busca de série histórica de inflação na API do BCB (SGS)
   export/
-    excel.py       exportação para .xlsx, uma aba por bloco (Resumo, Fluxo de
-                   Caixa, Ativo Financeiro, Financiamento)
+    excel.py       exportação para .xlsx com fórmulas vivas, em alto nível
+                   (Capa/Painel de Controle/Premissas/Projeções/Financiamento/
+                   Ativo Financeiro/Resultados) — todo valor derivado é
+                   fórmula auditável no Excel, não número pré-calculado
   ia/
     cliente.py     wrapper do Gemini (Google AI) — única porta de saída para IA
     explicacao.py  resumo em linguagem natural do ResultadoMEF
@@ -79,8 +87,10 @@ mef_engine/
     formulario.py  FormularioMEF (Pydantic) — schema simplificado de borda para a
                    interface web, com para_input_mef() e model_json_schema()
 web/
-  app.py       interface Streamlit do beta: senha compartilhada, formulário,
-               Calcular, download do Excel, explicação opcional por IA
+  app.py       interface Streamlit do beta: senha compartilhada, upload de
+               planilha (.csv/.xls/.xlsx) para CAPEX/OPEX/receita com modelo
+               para baixar, Calcular, download do Excel (fórmulas vivas),
+               explicação opcional por IA
 Dockerfile     imagem para Cloud Run (Streamlit, porta via $PORT)
 tests/
   test_validacao.py           núcleo + setores reais
@@ -92,7 +102,8 @@ tests/
   test_bifurcacao_receita.py  bifurcação por linha de receita: derivação, extremos
   test_deteccao_faixas.py     detecção automática de faixas por cabeçalho
   test_curva_desembolso.py    ingestão de CAPEX/OPEX com curva de desembolso
-  test_export_excel.py        exportação Excel: abas, omissão condicional, valores
+  test_export_excel.py        exportação Excel: abas, omissão condicional, fórmulas
+                               vivas + recálculo (pacote opcional `formulas`) vs. motor
   test_ia.py                  camadas de IA: orquestração sem rede (IA injetável)
   test_formulario.py          schema Pydantic do formulário: validação, preset, JSON Schema
 ```
@@ -253,20 +264,52 @@ malha (início do contrato); ajustar as chaves depois se necessário.
 um OPEX com ramp-up nos primeiros anos. Curva vazia (default) reproduz
 exatamente o `vetor_opex` anterior a esta mudança.
 
-## Exportação Excel (v3.8)
+## Exportação Excel com fórmulas vivas (v3.8 → v3.12)
 
-`mef_engine/export/excel.py` exporta o `ResultadoMEF` para `.xlsx`, uma aba
-por bloco: Resumo (indicadores de `resumo()` + metadados do projeto), Fluxo
-de Caixa (CAPEX/OPEX/receita/impostos/FCFF/FCFE período a período), Ativo
-Financeiro (só quando o regime contábil tem AF) e Financiamento (só quando
-há dívida sacada ou serviço de dívida) — abas sem conteúdo útil são
-omitidas, não geradas vazias.
+`mef_engine/export/excel.py` exporta o `ResultadoMEF` para `.xlsx` numa
+estrutura em alto nível equivalente à de um MEF profissional comum — Capa /
+Painel de Controle / Premissas / Projeções / Financiamento / Ativo
+Financeiro / Resultados — sem nenhuma referência a projeto, cor ou layout de
+terceiros: é uma organização genérica, não a cópia de um modelo específico.
+Abas sem conteúdo útil continuam omitidas (Financiamento só com dívida
+sacada; Ativo Financeiro só fora do regime intangível), não geradas vazias.
+
+A mudança central da v3.12: **todo valor DERIVADO entra como FÓRMULA do
+Excel**, não como o número já calculado pelo motor — impostos (indiretos,
+créditos, IR/CSLL com compensação de prejuízo ou lucro presumido),
+FCFF/FCFE, rolagem do ativo financeiro (com a taxa implícita via `=IRR(...)`
+direto na planilha), cronograma de dívida (saque/saldo/juros/amortização
+SAC) e os indicadores do Painel de Controle (TIR/VPL via `IRR`/`NPV`, totais
+via `SUM`) — tudo recalculável abrindo o `.xlsx`, igual a um MEF de mercado.
+Só a aba **Projeções** (CAPEX/OPEX/receita já distribuídos por período a
+partir das linhas de entrada — curva de desembolso, indexação) entra como
+valor: é o cronograma resolvido, equivalente a uma aba de premissas/
+operacional, não ao bloco de resultado.
+
+Mecanismo: a classe `_Premissas` guarda o endereço de cada célula escrita
+(`ref[nome]`) para que fórmulas em outras abas referenciem por NOME, nunca
+por número de linha hardcoded. Um ponto técnico que vale registrar: a
+fórmula fechada do juro de construção (deriva-se algebricamente o ponto fixo
+`juros = taxa/2*(2*saldo+saque+juros)` para uma expressão sem o termo `juros`
+do lado direito, eliminando a circularidade que o motor resolve em Python via
+`ponto_fixo`) e a célula auxiliar de amortização SAC por período referenciam
+a LINHA ESPECÍFICA do início da operação (`idx_op`, já conhecida em tempo de
+geração) — um `INDEX` sobre a faixa inteira criaria dependência circular
+TEXTUAL (mesmo sem ser circular em valor), porque linhas posteriores da
+mesma coluna dependem, por tabela, da própria célula auxiliar.
 
 `montar_workbook(inp, resultado)` monta o workbook em memória, separado de
-`exportar_excel(inp, resultado, caminho)` (que só chama `.save`) — permite
-testar valores de célula sem round-trip por disco. Estrutura montada por
-código, não um template `.xlsx` externo (não havia um disponível); ponto de
-extensão natural para preencher um template fornecido pelo usuário depois.
+`exportar_excel(inp, resultado, caminho)` (que só chama `.save`) — mesma
+assinatura pública de antes da v3.12, `web/app.py` não precisou mudar.
+
+Validação (`tests/test_export_excel.py`): confere a estrutura (abas
+certas presentes/omitidas, "Projeções" traz valor e "Resultados"/"Painel de
+Controle" trazem fórmula) e, se o pacote opcional `formulas` estiver
+instalado (`pip install formulas` — não é dependência do projeto, só de
+teste), RECALCULA as fórmulas geradas e confere contra o `ResultadoMEF` em 5
+cenários (bifurcado+dívida, intangível sem dívida, ativo financeiro puro,
+lucro presumido, sem compensação de prejuízo) — a prova de que a fórmula
+está certa, não só presente.
 
 ## Camadas de IA na borda (v3.9) — parsing assistido e explicação
 
@@ -370,6 +413,38 @@ beta-testers (decisão já tomada, ver seção de IA acima) — antes de
 publicar a URL do Cloud Run, configure um limite de gasto/cota nessa chave
 no Google AI Studio/Cloud Console, já que o app passa a ser acessível por
 qualquer pessoa com o link + senha.
+
+## Upload de planilha no formulário web (v3.11)
+
+Teste do protótipo mostrou a digitação manual linha a linha (CAPEX, OPEX,
+receita por volume) como o principal ponto de atrito de UX. Substituída por
+upload de planilha (`.csv`, `.xls` ou `.xlsx`) em três campos independentes,
+cada um com botão "baixar modelo" e mensagem de sucesso/erro — a
+contraprestação pública (receita fixa) continua manual, não foi pedida.
+
+  - **CAPEX/OPEX**: reaproveita o parser heurístico de `ingest/planilha.py`
+    (mesma filosofia de ancorar na linha de total e RECONCILIAR soma dos
+    itens vs. total declarado), generalizado para `.csv`/`.xls` além de
+    `.xlsx` via `carregar_grade` — um adaptador (`_GradeLista`) que expõe a
+    mesma interface de leitura por célula de uma worksheet openpyxl sobre uma
+    lista de listas, alimentada por `csv` (delimitador `,`/`;` detectado por
+    amostragem, números BR como `1.234,56` reconhecidos) ou `xlrd` (`.xls`).
+    `ingerir_arquivo_secao_unica` trata o arquivo inteiro como UMA seção só
+    (o upload já é dedicado a um bloco, não precisa detectar limites de
+    seção como `detectar_faixas`); `arquivo_para_capex`/`arquivo_para_opex`
+    (`ingest/__init__.py`) são o atalho usado pela interface web.
+  - **Receita (tarifa × volume)**: sem linha de total para ancorar, então o
+    módulo novo `ingest/receita.py` usa o CABEÇALHO de colunas (nome/tarifa/
+    volume/crescimento, por correspondência de substring normalizada) como
+    checagem de qualidade — falha de forma visível se as 3 colunas
+    obrigatórias não forem reconhecidas, em vez de ingerir dado incompleto.
+
+Dependência nova: `xlrd>=2.0` (`requirements.txt`), só usada para `.xls` (o
+formato antigo do Excel; `.xlsx` continua via `openpyxl`).
+
+Validado por simulação de upload via `streamlit.testing.v1.AppTest`
+(CSV em formato BR e internacional, e um caso de reconciliação falhando de
+propósito) e por smoke test direto das funções de ingestão.
 
 ## Próximos incrementos
 

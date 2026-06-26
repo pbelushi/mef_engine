@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mef_engine.api.formulario import FormularioMEF
 from mef_engine.core import TipoConcessao
 from mef_engine.engine import calcular
-from mef_engine.export import exportar_excel
+from mef_engine.export.excel import montar_workbook
 from mef_engine.ia.cliente import chave_configurada
 from mef_engine.ia.explicacao import explicar_resultado
 from mef_engine.ingest import (
@@ -53,18 +53,19 @@ def _modelo_receita() -> bytes:
                        ["Tarifa 1", 1.0, 100, 0]])
 
 
-def _upload_capex_opex(label: str, key: str, modelo: bytes, nome_modelo: str,
-                       conversor, campo_valor: str) -> list[dict]:
+def _bloco_upload(titulo: str, key: str, modelo: bytes, nome_modelo: str,
+                  conversor, campo_valor: str) -> list[dict]:
     """Upload + parsing de uma planilha de CAPEX/OPEX (item, valor, linha de
     Total opcional p/ reconciliação automática) — substitui a digitação
     manual linha a linha. `campo_valor` é 'valor_total' (CAPEX) ou
     'valor_periodo' (OPEX): o nome do dataclass do schema não muda, só o
     rótulo do campo que o formulário simplificado espera."""
-    st.caption("Planilha com itens em linhas e, opcionalmente, uma linha "
-              "'Total' para conferência automática da soma.")
-    st.download_button(f"Baixar modelo ({nome_modelo})", data=modelo,
-                       file_name=nome_modelo, mime="text/csv", key=f"{key}_modelo")
-    arquivo = st.file_uploader(label, type=TIPOS_PLANILHA, key=key)
+    c1, c2 = st.columns([3, 2])
+    c1.markdown(f"**{titulo}**")
+    c2.download_button("Baixar modelo", data=modelo, file_name=nome_modelo,
+                       mime="text/csv", key=f"{key}_modelo", use_container_width=True)
+    arquivo = st.file_uploader("Upload", type=TIPOS_PLANILHA, key=key,
+                               label_visibility="collapsed")
     if arquivo is None:
         return []
     try:
@@ -76,14 +77,13 @@ def _upload_capex_opex(label: str, key: str, modelo: bytes, nome_modelo: str,
     return [{"nome": l.nome, campo_valor: getattr(l, campo_valor)} for l in linhas]
 
 
-def _upload_receita() -> list[dict]:
-    st.caption("Planilha com colunas Nome, Tarifa, Volume por período e, "
-              "opcionalmente, Crescimento anual (%).")
-    st.download_button("Baixar modelo (receita)", data=_modelo_receita(),
-                       file_name="modelo_receita.csv", mime="text/csv",
-                       key="receita_modelo")
-    arquivo = st.file_uploader("Planilha de receita (tarifa × volume)",
-                               type=TIPOS_PLANILHA, key="upload_receita")
+def _bloco_upload_receita() -> list[dict]:
+    c1, c2 = st.columns([3, 2])
+    c1.markdown("**Receita Tarifária**")
+    c2.download_button("Baixar modelo", data=_modelo_receita(), file_name="modelo_receita.csv",
+                       mime="text/csv", key="receita_modelo", use_container_width=True)
+    arquivo = st.file_uploader("Upload", type=TIPOS_PLANILHA, key="upload_receita",
+                               label_visibility="collapsed")
     if arquivo is None:
         return []
     try:
@@ -116,85 +116,98 @@ def _checar_senha() -> bool:
         return True
     if st.session_state.get("autenticado"):
         return True
-    senha = st.text_input("Senha de acesso (beta)", type="password")
-    if senha and senha == senha_esperada:
-        st.session_state["autenticado"] = True
-        st.rerun()
-    elif senha:
-        st.error("Senha incorreta.")
+
+    st.subheader(":green[Digite a senha]")
+    with st.container(border=True):
+        with st.form("login", border=False):
+            senha = st.text_input("Senha", type="password", placeholder="Senha",
+                                  label_visibility="collapsed")
+            enviado = st.form_submit_button("Submit", type="primary")
+    if enviado:
+        if senha == senha_esperada:
+            st.session_state["autenticado"] = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
     return False
 
 
-def _formulario_sidebar() -> FormularioMEF | None:
-    st.sidebar.header("Dados do projeto")
-    projeto = st.sidebar.text_input("Nome do projeto", "Minha concessão")
-    tipo = st.sidebar.selectbox(
-        "Tipo de concessão", list(TipoConcessao),
-        format_func=lambda t: t.value.capitalize())
-    data_base = st.sidebar.date_input("Data-base", date.today())
-    inicio_ppp = st.sidebar.date_input("Início da PPP/concessão", date.today())
-    prazo_periodos = st.sidebar.number_input("Prazo (anos)", min_value=1, value=20)
-    inicio_operacao = st.sidebar.date_input("Início da operação", date.today())
-    taxa_desconto = st.sidebar.number_input(
-        "Taxa de desconto anual (%)", min_value=0.0, value=8.0, step=0.5) / 100
+def _formulario_principal() -> FormularioMEF | None:
+    col_esq, col_dir = st.columns([1, 1.2], gap="large")
 
-    st.subheader("CAPEX")
-    capex = _upload_capex_opex(
-        "Planilha de CAPEX", "upload_capex", _modelo_capex(), "modelo_capex.csv",
-        arquivo_para_capex, "valor_total")
+    with col_esq:
+        st.subheader(":green[Dados do Projeto]")
+        projeto = st.text_input("Nome do projeto", "Minha concessão")
+        tipo = st.selectbox(
+            "Tipo de concessão", list(TipoConcessao),
+            format_func=lambda t: t.value.capitalize())
+        data_base = st.date_input("Data base", date.today())
+        inicio_ppp = st.date_input("Início da concessão", date.today())
+        prazo_periodos = st.number_input("Prazo (anos)", min_value=1, value=20)
+        inicio_operacao = st.date_input("Início da operação", date.today())
+        taxa_desconto = st.number_input(
+            "Taxa de desconto anual (%)", min_value=0.0, value=8.0, step=0.5) / 100
 
-    st.subheader("OPEX")
-    opex = _upload_capex_opex(
-        "Planilha de OPEX", "upload_opex", _modelo_opex(), "modelo_opex.csv",
-        arquivo_para_opex, "valor_periodo")
+    with col_dir:
+        with st.container(border=True):
+            capex = _bloco_upload("CAPEX", "upload_capex", _modelo_capex(),
+                                  "modelo_capex.csv", arquivo_para_capex, "valor_total")
+            opex = _bloco_upload("OPEX", "upload_opex", _modelo_opex(),
+                                 "modelo_opex.csv", arquivo_para_opex, "valor_periodo")
+            receitas_volume = _bloco_upload_receita()
 
-    st.subheader("Receita tarifária (volume × tarifa)")
-    receitas_volume = _upload_receita()
+            st.markdown("**Contraprestação pública (valor fixo por período)**")
+            n_receita_fixa = st.number_input(
+                "Número de linhas", min_value=0, value=0, key="n_receita_fixa",
+                label_visibility="collapsed")
+            receitas_fixas = []
+            for i in range(n_receita_fixa):
+                c1, c2 = st.columns(2)
+                nome = c1.text_input(f"Nome contraprestação {i+1}", f"Contraprestação {i+1}",
+                                     key=f"rf_nome_{i}")
+                valor = c2.number_input(f"Valor por período {i+1}", min_value=0.0, value=10.0,
+                                        key=f"rf_valor_{i}")
+                receitas_fixas.append({"nome": nome, "valor_periodo": valor})
 
-    st.subheader("Contraprestação pública (valor fixo por período)")
-    n_receita_fixa = st.number_input("Número de linhas de contraprestação", min_value=0,
-                                     value=0, key="n_receita_fixa")
-    receitas_fixas = []
-    for i in range(n_receita_fixa):
-        c1, c2 = st.columns(2)
-        nome = c1.text_input(f"Nome contraprestação {i+1}", f"Contraprestação {i+1}",
-                             key=f"rf_nome_{i}")
-        valor = c2.number_input(f"Valor por período {i+1}", min_value=0.0, value=10.0,
-                                key=f"rf_valor_{i}")
-        receitas_fixas.append({"nome": nome, "valor_periodo": valor})
+            calcular_clicado = st.button("Calcular", type="primary", use_container_width=True)
+            if calcular_clicado:
+                try:
+                    form = FormularioMEF(
+                        projeto=projeto, tipo_concessao=tipo, data_base=data_base,
+                        inicio_ppp=inicio_ppp, prazo_periodos=int(prazo_periodos),
+                        inicio_operacao=inicio_operacao, taxa_desconto_anual=taxa_desconto,
+                        capex=capex, opex=opex, receitas_fixas=receitas_fixas,
+                        receitas_volume=receitas_volume,
+                    )
+                    inp = form.para_input_mef()
+                    st.session_state["inp"] = inp
+                    st.session_state["resultado"] = calcular(inp)
+                except Exception as e:
+                    st.error(f"Formulário inválido: {e}")
 
-    try:
-        return FormularioMEF(
-            projeto=projeto, tipo_concessao=tipo, data_base=data_base,
-            inicio_ppp=inicio_ppp, prazo_periodos=int(prazo_periodos),
-            inicio_operacao=inicio_operacao, taxa_desconto_anual=taxa_desconto,
-            capex=capex, opex=opex, receitas_fixas=receitas_fixas,
-            receitas_volume=receitas_volume,
-        )
-    except Exception as e:
-        st.sidebar.error(f"Formulário inválido: {e}")
-        return None
+            if "resultado" in st.session_state:
+                buffer = io.BytesIO()
+                montar_workbook(st.session_state["inp"], st.session_state["resultado"]).save(buffer)
+                st.download_button(
+                    "Download", data=buffer.getvalue(),
+                    file_name=f"{st.session_state['inp'].projeto}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+            else:
+                st.button("Download", disabled=True, use_container_width=True)
 
 
 def main():
-    st.title("Motor MEF — Beta")
-    st.caption("Modelo Econômico-Financeiro de concessões/PPP — protótipo de teste.")
+    st.title("💠 :green[Motor MEF — Beta]")
+    st.caption("Modelo Econômico Financeiro de concessões/PPP - protótipo de teste")
 
     if not _checar_senha():
         return
 
-    form = _formulario_sidebar()
-    if form is None:
-        return
-
-    if st.button("Calcular", type="primary"):
-        inp = form.para_input_mef()
-        resultado = calcular(inp)
-        st.session_state["inp"] = inp
-        st.session_state["resultado"] = resultado
+    _formulario_principal()
 
     if "resultado" not in st.session_state:
-        st.info("Preencha o formulário na barra lateral e clique em Calcular.")
+        st.info("Preencha o formulário acima e clique em Calcular.")
         return
 
     inp = st.session_state["inp"]
@@ -203,13 +216,6 @@ def main():
     st.subheader("Resumo")
     st.table({"Indicador": list(resultado.resumo().keys()),
              "Valor": [str(v) for v in resultado.resumo().values()]})
-
-    buffer = io.BytesIO()
-    from mef_engine.export.excel import montar_workbook
-    montar_workbook(inp, resultado).save(buffer)
-    st.download_button("Baixar Excel", data=buffer.getvalue(),
-                       file_name=f"{inp.projeto}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     st.subheader("Explicação por IA (opcional)")
     if not chave_configurada():
